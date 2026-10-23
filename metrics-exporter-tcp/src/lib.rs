@@ -604,7 +604,7 @@ fn convert_metric_to_protobuf_encoded(
 ) -> Result<Bytes, EncodeError> {
     let name = key.name().to_string();
     let labels = key
-        .labels()
+        .labels_iter()
         .map(|label| (label.key().to_owned(), label.value().to_owned()))
         .collect::<BTreeMap<_, _>>();
     let operation = match operation {

@@ -283,7 +283,7 @@ impl PayloadWriter {
         }
 
         // Write any tags that are present on the key first, and then additionally write any global tags.
-        let tags = key.labels();
+        let tags = key.labels_iter();
         let mut wrote_tag = false;
         for tag in tags.chain(self.global_tags.iter()) {
             // If we haven't written a tag yet, write out the tags prefix first.

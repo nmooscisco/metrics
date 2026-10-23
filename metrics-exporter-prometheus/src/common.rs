@@ -93,7 +93,7 @@ impl LabelSet {
         global_labels: &IndexMap<String, String>,
     ) -> Self {
         let mut labels = global_labels.clone();
-        key.labels().for_each(|label| {
+        key.labels_iter().for_each(|label| {
             labels.insert(label.key().to_string(), label.value().to_string());
         });
         Self { labels: labels.into_iter().collect() }

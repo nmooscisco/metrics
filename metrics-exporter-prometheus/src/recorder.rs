@@ -471,7 +471,25 @@ impl PrometheusHandle {
 mod tests {
     use super::*;
     use crate::PrometheusBuilder;
-    use metrics::{counter, gauge, histogram, Label};
+    use metrics::{counter, gauge, histogram, Label, LabelSet};
+
+    /// The registry retains shared prefixes and merges equivalent flat keys when rendering.
+    #[test]
+    fn registry_preserves_shared_prefixes() {
+        let base: Arc<[Label]> = vec![Label::new("label_a", "value_a")].into();
+        let labels = LabelSet::from(Arc::clone(&base)).with_extra_labels(&[("label_b", "value_b")]);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            counter!("metric_a", &labels).increment(3);
+            counter!("metric_a", "label_b" => "value_b", "label_a" => "value_a").increment(4);
+        });
+        let counters = recorder.inner.registry.get_counter_handles();
+        assert_eq!(counters.len(), 1);
+        let key = counters.keys().next().unwrap();
+        assert!(std::ptr::eq(key.labels_iter().next().unwrap(), &base[0]));
+        let rendered = recorder.handle().render();
+        assert!(rendered.contains("metric_a{label_a=\"value_a\",label_b=\"value_b\"} 7"));
+    }
 
     #[test]
     fn registry_preserves_shared_labels_and_content_identity() {

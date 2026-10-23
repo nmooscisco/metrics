@@ -1,10 +1,9 @@
-use crate::{cow::Cow, IntoLabels, Label, SharedString};
+use crate::{IntoLabels, Label, LabelSet, Labels, SharedString};
 use rapidhash::v3::{rapidhash_v3_nano_inline, RapidSecrets};
 use std::{
     borrow::Borrow,
     cmp, fmt,
     hash::{Hash, Hasher},
-    slice::Iter,
     sync::Arc,
 };
 
@@ -80,7 +79,7 @@ impl From<KeyName> for std::borrow::Cow<'static, str> {
 #[derive(Debug, Clone)]
 pub struct Key {
     name: KeyName,
-    labels: Cow<'static, [Label]>,
+    labels: LabelSet,
     hash: u64,
 }
 
@@ -91,7 +90,7 @@ impl Key {
         N: Into<KeyName>,
     {
         let name = name.into();
-        let labels = Cow::from_owned(Vec::new());
+        let labels = LabelSet::default();
 
         Self::builder(name, labels)
     }
@@ -103,7 +102,7 @@ impl Key {
         L: IntoLabels,
     {
         let name = name.into();
-        let labels = labels.into_shared_labels();
+        let labels = labels.into_label_set();
 
         Self::builder(name, labels)
     }
@@ -134,7 +133,7 @@ impl Key {
     where
         N: Into<KeyName>,
     {
-        Self::builder(name.into(), Cow::const_slice(labels))
+        Self::builder(name.into(), LabelSet::const_slice(labels))
     }
 
     /// Creates a [`Key`] from a static name.
@@ -148,11 +147,13 @@ impl Key {
     ///
     /// This function is `const`, so it can be used in a static context.
     pub const fn from_static_parts(name: &'static str, labels: &'static [Label]) -> Self {
-        Self::builder(KeyName::from_const_str(name), Cow::const_slice(labels))
+        let name = KeyName::from_const_str(name);
+        let hash = hash_name(&name).wrapping_add(hash_labels(labels));
+        Self { name, labels: LabelSet::const_slice(labels), hash }
     }
 
-    const fn builder(name: KeyName, labels: Cow<'static, [Label]>) -> Self {
-        let hash = generate_key_hash(&name, &labels);
+    fn builder(name: KeyName, labels: LabelSet) -> Self {
+        let hash = hash_name(&name).wrapping_add(labels.hash_sum());
         Self { name, labels, hash }
     }
 
@@ -168,7 +169,7 @@ impl Key {
 
     /// Creates a key with a different name and the same labels.
     ///
-    /// Static and shared label storage is reused. Owned label storage is copied into an Arc,
+    /// Static, shared, and prefixed label storage is reused. Owned label storage is copied into an Arc,
     /// so cloning the returned key does not copy its label array.
     pub fn with_name<N>(&self, name: N) -> Self
     where
@@ -178,7 +179,15 @@ impl Key {
     }
 
     /// Labels of this key, if they exist.
-    pub fn labels(&self) -> Iter<'_, Label> {
+    ///
+    /// This preserves the slice iterator API. For a shared prefix, the first call builds and
+    /// caches a flat array. Use [`Key::labels_iter`] to iterate without that copy.
+    pub fn labels(&self) -> std::slice::Iter<'_, Label> {
+        self.labels.as_ref().iter()
+    }
+
+    /// Iterates over labels without copying shared prefixes.
+    pub fn labels_iter(&self) -> Labels<'_> {
         self.labels.iter()
     }
 
@@ -196,17 +205,27 @@ impl Key {
         Self { name: self.name.to_retained(), labels: self.labels.to_retained(), hash: self.hash }
     }
 
-    /// Clones this [`Key`], and expands the existing set of labels.
+    /// Clones this [`Key`], sharing its labels as a prefix of the expanded set.
+    ///
+    /// Existing label keys are kept, even when an added label has the same key.
     pub fn with_extra_labels(&self, extra_labels: Vec<Label>) -> Self {
+        self.with_extra_label_set(extra_labels)
+    }
+
+    /// Clones this key and appends a label set, preserving shared storage in both inputs.
+    ///
+    /// Unlike [`Key::with_extra_labels`], this also accepts [`LabelSet`] and other
+    /// [`IntoLabels`] implementations. Repeated label keys are kept.
+    pub fn with_extra_label_set<L: IntoLabels>(&self, extra_labels: L) -> Self {
+        let extra_labels = extra_labels.into_label_set();
         if extra_labels.is_empty() {
             return self.clone();
         }
 
         let name = self.name.clone();
-        let mut labels = self.labels.clone().into_owned();
-        labels.extend(extra_labels);
+        let labels = self.labels.with_extra_labels(extra_labels);
 
-        Self::builder(name, labels.into())
+        Self::builder(name, labels)
     }
 
     /// Gets the hash value for this key.
@@ -218,7 +237,7 @@ impl Key {
 
 /// Generate a hash value for a `Key`.
 #[inline]
-const fn generate_key_hash(name: &KeyName, labels: &Cow<'static, [Label]>) -> u64 {
+const fn hash_name(name: &KeyName) -> u64 {
     // Here we explicitly use a static seed. We believe HashDoS should not be a concern here, as
     // the primary use case is static metric keys coming from the application code itself. Users
     // could allow untrusted input to form a metric key, but it's not a use case we are designing
@@ -231,13 +250,17 @@ const fn generate_key_hash(name: &KeyName, labels: &Cow<'static, [Label]>) -> u6
     // The name uses an independent seed to avoid simple substitution errors (where a user swaps a
     // label with the key name for example). We use `seed_cpp` to ensure the secrets arrays are the
     // same const array so the compiler can optimise the loading of secrets as the same immediates.
-    let mut hash = hash_bytes(name.0.as_const_str().as_bytes(), &SECRETS);
+    hash_bytes(name.0.as_const_str().as_bytes(), &SECRETS)
+}
+
+/// The order-independent contribution of labels to a key hash.
+pub(crate) const fn hash_labels(labels: &[Label]) -> u64 {
+    let mut hash = 0u64;
 
     // Label order should _not_ change the resulting hash. The use of addition here is a hack,
     // this is both faster than sorting the labels and feasible in `const`. We use an ADD chain
     // as opposed to an XOR chain to avoid duplicate labels cancelling out.
     let mut i = 0;
-    let labels = labels.as_const_slice();
     while i < labels.len() {
         let label_hash = hash_label(&labels[i]);
         hash = hash.wrapping_add(label_hash);
@@ -281,29 +304,29 @@ impl PartialEq for Key {
         if self.labels.len() != other.labels.len() {
             return false;
         }
-        if std::ptr::eq(self.labels.as_ref(), other.labels.as_ref()) {
+        if self.labels.ptr_eq(&other.labels) {
             return true;
         }
         match self.labels.len() {
             0 => true,
-            1 => self.labels[0] == other.labels[0],
+            1 => self.labels.label_at(0) == other.labels.label_at(0),
             2 => {
-                if self.labels[0] == other.labels[0] {
-                    self.labels[1] == other.labels[1]
-                } else if self.labels[0] == other.labels[1] {
-                    self.labels[1] == other.labels[0]
+                if self.labels.label_at(0) == other.labels.label_at(0) {
+                    self.labels.label_at(1) == other.labels.label_at(1)
+                } else if self.labels.label_at(0) == other.labels.label_at(1) {
+                    self.labels.label_at(1) == other.labels.label_at(0)
                 } else {
                     false
                 }
             }
             n if n < 8 => {
                 let mut labels_sort_map: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-                labels_sort_map[..n].sort_by_key(|i| self.labels[*i as usize].key());
+                labels_sort_map[..n].sort_by_key(|i| self.labels.label_at(*i as usize));
                 let mut his_labels_sort_map: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-                his_labels_sort_map[..n].sort_by_key(|i| other.labels[*i as usize].key());
+                his_labels_sort_map[..n].sort_by_key(|i| other.labels.label_at(*i as usize));
                 for i in 0..n {
-                    if self.labels[labels_sort_map[i] as usize]
-                        != other.labels[his_labels_sort_map[i] as usize]
+                    if self.labels.label_at(labels_sort_map[i] as usize)
+                        != other.labels.label_at(his_labels_sort_map[i] as usize)
                     {
                         return false;
                     }
@@ -312,11 +335,13 @@ impl PartialEq for Key {
             }
             n => {
                 let mut labels_sort_map: Vec<usize> = (0..n).collect();
-                labels_sort_map.sort_by_key(|i| self.labels[*i].key());
+                labels_sort_map.sort_by_key(|i| self.labels.label_at(*i));
                 let mut his_labels_sort_map: Vec<usize> = (0..n).collect();
-                his_labels_sort_map.sort_by_key(|i| other.labels[*i].key());
+                his_labels_sort_map.sort_by_key(|i| other.labels.label_at(*i));
                 for i in 0..n {
-                    if self.labels[labels_sort_map[i]] != other.labels[his_labels_sort_map[i]] {
+                    if self.labels.label_at(labels_sort_map[i])
+                        != other.labels.label_at(his_labels_sort_map[i])
+                    {
                         return false;
                     }
                 }
@@ -341,20 +366,22 @@ impl Ord for Key {
             cmp::Ordering::Equal => {}
             cmp::Ordering::Greater => return cmp::Ordering::Greater,
         }
-        if std::ptr::eq(self.labels.as_ref(), other.labels.as_ref()) {
+        if self.labels.ptr_eq(&other.labels) {
             return cmp::Ordering::Equal;
         }
         match self.labels.len() {
             0 => cmp::Ordering::Equal,
-            1 => self.labels[0].cmp(&other.labels[0]),
+            1 => self.labels.label_at(0).cmp(other.labels.label_at(0)),
             n if n < 8 => {
                 let mut labels_sort_map: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-                labels_sort_map[..n].sort_by_key(|i| self.labels[*i as usize].key());
+                labels_sort_map[..n].sort_by_key(|i| self.labels.label_at(*i as usize));
                 let mut his_labels_sort_map: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-                his_labels_sort_map[..n].sort_by_key(|i| other.labels[*i as usize].key());
+                his_labels_sort_map[..n].sort_by_key(|i| other.labels.label_at(*i as usize));
                 for i in 0..n {
-                    match self.labels[labels_sort_map[i] as usize]
-                        .cmp(&other.labels[his_labels_sort_map[i] as usize])
+                    match self
+                        .labels
+                        .label_at(labels_sort_map[i] as usize)
+                        .cmp(other.labels.label_at(his_labels_sort_map[i] as usize))
                     {
                         cmp::Ordering::Less => return cmp::Ordering::Less,
                         cmp::Ordering::Equal => {}
@@ -365,11 +392,14 @@ impl Ord for Key {
             }
             n => {
                 let mut labels_sort_map: Vec<usize> = (0..n).collect();
-                labels_sort_map.sort_by_key(|i| self.labels[*i].key());
+                labels_sort_map.sort_by_key(|i| self.labels.label_at(*i));
                 let mut his_labels_sort_map: Vec<usize> = (0..n).collect();
-                his_labels_sort_map.sort_by_key(|i| other.labels[*i].key());
+                his_labels_sort_map.sort_by_key(|i| other.labels.label_at(*i));
                 for i in 0..n {
-                    match self.labels[labels_sort_map[i]].cmp(&other.labels[his_labels_sort_map[i]])
+                    match self
+                        .labels
+                        .label_at(labels_sort_map[i])
+                        .cmp(other.labels.label_at(his_labels_sort_map[i]))
                     {
                         cmp::Ordering::Less => return cmp::Ordering::Less,
                         cmp::Ordering::Equal => {}
@@ -401,7 +431,7 @@ impl fmt::Display for Key {
         } else {
             write!(f, "Key({}, [", self.name.as_str())?;
             let mut first = true;
-            for label in self.labels.as_ref() {
+            for label in self.labels.iter() {
                 if first {
                     write!(f, "{} = {}", label.0, label.1)?;
                     first = false;

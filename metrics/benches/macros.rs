@@ -5,7 +5,8 @@ use criterion::Criterion;
 use std::sync::Arc;
 
 use metrics::{
-    counter, Counter, Gauge, Histogram, Key, KeyName, Label, Metadata, Recorder, SharedString, Unit,
+    counter, Counter, Gauge, Histogram, Key, KeyName, Label, LabelSet, Metadata, Recorder,
+    SharedString, Unit,
 };
 
 #[derive(Debug)]
@@ -122,5 +123,83 @@ fn shared_labels_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, macro_benchmark, shared_labels_benchmark);
+fn shared_prefix_benchmark(c: &mut Criterion) {
+    use std::hint::black_box;
+
+    let parent = LabelSet::from(
+        (0..16)
+            .map(|i| Label::new(format!("label_{}", i), Arc::<str>::from(i.to_string())))
+            .collect::<Vec<_>>(),
+    );
+    let extra = vec![Label::new("label_c", Arc::<str>::from("value_c"))];
+    let names =
+        ["metric_0", "metric_1", "metric_2", "metric_3", "metric_4", "metric_5", "metric_6"];
+    let mut group = c.benchmark_group("shared_prefix/extend_and_retain_seven_keys");
+    group.bench_function("flat", |b| {
+        b.iter(|| {
+            let labels: Arc<[Label]> =
+                black_box(&parent).iter().chain(black_box(&extra).iter()).cloned().collect();
+            names
+                .iter()
+                .map(|name| Key::from_parts(*name, Arc::clone(&labels)).to_retained())
+                .collect::<Vec<_>>()
+        });
+    });
+    group.bench_function("prefix", |b| {
+        b.iter(|| {
+            let labels = black_box(&parent).with_extra_labels(black_box(extra.clone()));
+            names
+                .iter()
+                .map(|name| Key::from_parts(*name, &labels).to_retained())
+                .collect::<Vec<_>>()
+        });
+    });
+    group.finish();
+}
+
+fn shared_sets_benchmark(c: &mut Criterion) {
+    use std::hint::black_box;
+
+    let sets: Vec<_> = (0..2)
+        .map(|set| {
+            LabelSet::from(
+                (0..16)
+                    .map(|index| {
+                        Label::new(
+                            format!("label_{}_{}", set, index),
+                            Arc::<str>::from(index.to_string()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let mut group = c.benchmark_group("shared_sets/combine_and_retain_seven_keys");
+    for shared in [false, true] {
+        group.bench_function(if shared { "shared" } else { "copied_suffix" }, |b| {
+            b.iter(|| {
+                let first = black_box(&sets[0]);
+                let second = black_box(&sets[1]);
+                let labels = if shared {
+                    first.with_extra_labels(second)
+                } else {
+                    first.with_extra_labels(second.iter().cloned().collect::<Vec<_>>())
+                };
+                ["metric_0", "metric_1", "metric_2", "metric_3", "metric_4", "metric_5", "metric_6"]
+                    .iter()
+                    .map(|name| Key::from_parts(*name, &labels).to_retained())
+                    .collect::<Vec<_>>()
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    macro_benchmark,
+    shared_labels_benchmark,
+    shared_prefix_benchmark,
+    shared_sets_benchmark
+);
 criterion_main!(benches);

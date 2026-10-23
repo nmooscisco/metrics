@@ -96,7 +96,7 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<(), Box<dyn E
                 let inner_key = key.key();
                 let name = inner_key.name();
                 let labels = inner_key
-                    .labels()
+                    .labels_iter()
                     .map(|label| format!("{} = {}", label.key(), label.value()))
                     .collect::<Vec<_>>();
                 let display_name = if labels.is_empty() {
